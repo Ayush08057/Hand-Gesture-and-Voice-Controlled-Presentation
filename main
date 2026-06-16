@@ -1,0 +1,470 @@
+import json
+import queue
+import threading
+import time
+from pathlib import Path
+import cv2
+import mediapipe as mp
+import pyautogui
+import sounddevice as sd
+import vosk
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.1
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# VOSK MODEL FOLDER
+MODEL_PATH = SCRIPT_DIR / "vosk-model-small-en-us-0.15"
+
+VOICE_GRAMMAR = json.dumps([
+    "next",
+    "back",
+    "previous",
+    "start",
+    "stop",
+    "[unk]"
+])
+
+VOICE_COOLDOWN_SECONDS = 1.2
+GESTURE_COOLDOWN_SECONDS = 1
+
+# =========================================================
+# QUEUES
+# =========================================================
+
+command_queue = queue.Queue()
+audio_queue = queue.Queue(maxsize=50)
+
+voice_status = "Loading voice model..."
+last_heard_text = ""
+
+last_voice_command_time = 0
+
+status_lock = threading.Lock()
+
+# =========================================================
+# MEDIAPIPE
+# =========================================================
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    max_num_hands=1,
+    min_detection_confidence=0.8,
+    min_tracking_confidence=0.8,
+)
+
+# =========================================================
+# CAMERA
+# =========================================================
+
+cap = cv2.VideoCapture(0)
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+last_gesture = None
+last_action_time = 0
+
+# =========================================================
+# STATUS
+# =========================================================
+
+def set_voice_status(status, heard=""):
+
+    global voice_status, last_heard_text
+
+    with status_lock:
+
+        voice_status = status
+
+        if heard:
+            last_heard_text = heard
+
+# =========================================================
+# PARSE VOICE
+# =========================================================
+
+def parse_voice_command(text):
+
+    words = set(text.split())
+
+    if "next" in words:
+        return "NEXT"
+
+    if "back" in words or "previous" in words:
+        return "PREVIOUS"
+
+    if "start" in words:
+        return "START"
+
+    if "stop" in words:
+        return "STOP"
+
+    return None
+
+# =========================================================
+# COMMAND EXECUTION
+# =========================================================
+
+def enqueue_command(command, source):
+
+    global last_voice_command_time
+
+    if source == "voice":
+
+        now = time.time()
+
+        if now - last_voice_command_time < VOICE_COOLDOWN_SECONDS:
+            return
+
+        last_voice_command_time = now
+
+    command_queue.put(command)
+
+    print(f"\n{source.upper()} COMMAND: {command}\n", flush=True)
+
+# =========================================================
+# AUDIO CALLBACK
+# =========================================================
+
+def audio_callback(indata, frames, time_info, status):
+
+    if status:
+        print("Audio Status:", status)
+
+    try:
+        audio_queue.put_nowait(bytes(indata))
+
+    except queue.Full:
+        pass
+
+# =========================================================
+# VOICE RECOGNITION
+# =========================================================
+
+def voice_recognition_worker():
+
+    global voice_status
+
+    print("MODEL PATH:", MODEL_PATH)
+    print("MODEL EXISTS:", MODEL_PATH.exists())
+
+    if not MODEL_PATH.is_dir():
+
+        set_voice_status("ERROR: model missing")
+
+        print("\nERROR: MODEL FOLDER NOT FOUND\n")
+
+        return
+
+    print("\nLoading Vosk model...\n")
+
+    try:
+
+        vosk.SetLogLevel(-1)
+
+        model = vosk.Model(str(MODEL_PATH))
+
+        print("\nVOICE MODEL LOADED SUCCESSFULLY\n")
+
+    except Exception as e:
+
+        print("\nVOICE MODEL ERROR:\n", e)
+
+        return
+
+    samplerate = 16000
+
+    recognizer = vosk.KaldiRecognizer(
+        model,
+        samplerate,
+        VOICE_GRAMMAR
+    )
+
+    set_voice_status("Ready")
+
+    print("\nVoice Ready")
+    print("Say: next | back | start | stop\n")
+
+    while True:
+
+        audio_data = audio_queue.get()
+
+        if recognizer.AcceptWaveform(audio_data):
+
+            result = json.loads(recognizer.Result())
+
+            text = result.get("text", "").strip().lower()
+
+            if text and text != "[unk]":
+
+                print(f"\nYOU SAID: {text}\n")
+
+                set_voice_status(f"Heard: {text}", text)
+
+                command = parse_voice_command(text)
+
+                if command:
+                    enqueue_command(command, "voice")
+
+# =========================================================
+# MICROPHONE THREAD
+# =========================================================
+
+def voice_microphone_thread():
+
+    print("\nMicrophone thread started\n")
+
+    samplerate = 16000
+
+    try:
+
+        with sd.RawInputStream(
+            samplerate=samplerate,
+            blocksize=4000,
+            device=None,
+            dtype="int16",
+            channels=1,
+            callback=audio_callback,
+        ):
+
+            while True:
+                time.sleep(0.1)
+
+    except Exception as exc:
+
+        set_voice_status("Mic error")
+
+        print("\nMICROPHONE ERROR:\n", exc)
+
+        print("\nEnable microphone permissions in Windows.\n")
+
+# =========================================================
+# EXECUTE COMMANDS
+# =========================================================
+
+def execute_commands():
+
+    while True:
+
+        cmd = command_queue.get()
+
+        print(f"\nEXECUTING: {cmd}\n")
+
+        time.sleep(0.15)
+
+        if cmd == "NEXT":
+            pyautogui.press("right")
+
+        elif cmd == "PREVIOUS":
+            pyautogui.press("left")
+
+        elif cmd == "START":
+            pyautogui.press("f5")
+
+        elif cmd == "STOP":
+            pyautogui.press("esc")
+
+# =========================================================
+# START THREADS
+# =========================================================
+
+threading.Thread(
+    target=voice_recognition_worker,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=voice_microphone_thread,
+    daemon=True
+).start()
+
+threading.Thread(
+    target=execute_commands,
+    daemon=True
+).start()
+
+# =========================================================
+# PERFECT GESTURE DETECTION
+# =========================================================
+
+gesture_history = []
+
+def count_fingers(hand_landmarks):
+
+    lm = hand_landmarks.landmark
+
+    fingers = 0
+
+    # INDEX
+    if lm[8].y < lm[6].y:
+        fingers += 1
+
+    # MIDDLE
+    if lm[12].y < lm[10].y:
+        fingers += 1
+
+    # RING
+    if lm[16].y < lm[14].y:
+        fingers += 1
+
+    # PINKY
+    if lm[20].y < lm[18].y:
+        fingers += 1
+
+    return fingers
+
+def get_gesture(fingers_up):
+
+    if fingers_up == 1:
+        return "NEXT"
+
+    elif fingers_up == 2:
+        return "PREVIOUS"
+
+    elif fingers_up == 3:
+        return "START"
+
+    elif fingers_up == 4:
+        return "STOP"
+
+    return None
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+print("\nGesture + Voice Presentation Tool Started")
+print("Press Q to Quit\n")
+
+frame_count = 0
+
+while True:
+
+    ret, frame = cap.read()
+
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+
+    frame_count += 1
+
+    gesture_text = "No gesture"
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    results = hands.process(rgb_frame)
+
+    if results.multi_hand_landmarks:
+
+        for hand_landmarks in results.multi_hand_landmarks:
+
+            mp_drawing.draw_landmarks(
+                frame,
+                hand_landmarks,
+                mp_hands.HAND_CONNECTIONS,
+            )
+
+            fingers_up = count_fingers(hand_landmarks)
+
+            gesture = get_gesture(fingers_up)
+
+            gesture_history.append(gesture)
+
+            # KEEP LAST 12 FRAMES
+            if len(gesture_history) > 12:
+                gesture_history.pop(0)
+
+            stable_gesture = None
+
+            # STABLE DETECTION
+            if gesture_history.count(gesture) >= 8:
+                stable_gesture = gesture
+
+            if stable_gesture:
+
+                gesture_text = f"Gesture: {stable_gesture}"
+
+                current_time = time.time()
+
+                if (
+                    stable_gesture != last_gesture
+                    or current_time - last_action_time > GESTURE_COOLDOWN_SECONDS
+                ):
+
+                    enqueue_command(
+                        stable_gesture,
+                        "gesture"
+                    )
+
+                    last_gesture = stable_gesture
+                    last_action_time = current_time
+
+            else:
+                gesture_text = f"Fingers: {fingers_up}"
+
+    # =====================================================
+    # STATUS DISPLAY
+    # =====================================================
+
+    with status_lock:
+        vstatus = voice_status
+        heard = last_heard_text
+
+    cv2.putText(
+        frame,
+        gesture_text,
+        (10, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (255, 255, 255),
+        2,
+    )
+
+    cv2.putText(
+        frame,
+        f"Voice: {vstatus}",
+        (10, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+    )
+
+    if heard:
+
+        cv2.putText(
+            frame,
+            f"Last: {heard}",
+            (10, 100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+        )
+
+    cv2.imshow(
+        "Gesture + Voice Presentation Tool",
+        frame
+    )
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+# =========================================================
+# CLEANUP
+# =========================================================
+
+cap.release()
+
+cv2.destroyAllWindows()
+
+hands.close()
